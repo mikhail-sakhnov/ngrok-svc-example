@@ -13,6 +13,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -27,6 +28,7 @@ func check(e error) {
 const (
 	ngrokLabel     = "ngrok"
 	ngrokNamespace = "ngrok-tunnel"
+	finalizerName  = "ngrok.io/tunnel"
 )
 
 func main() {
@@ -37,7 +39,7 @@ func main() {
 	config, err := clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
 	check(err)
 	mgr, err := manager.New(config, manager.Options{
-		Logger: zap.New(), // let's be verbose
+		Logger: zap.New(zap.UseDevMode(true)), // let's be verbose
 	})
 	check(err)
 	l := mgr.GetLogger()
@@ -48,37 +50,83 @@ func main() {
 		ControllerManagedBy(mgr).
 		For(&corev1.Service{}).
 		Owns(&corev1.Pod{}).
-		Complete(reconcile.Func(func(c context.Context, r reconcile.Request) (reconcile.Result, error) {
+		Complete(reconcile.Func(func(ctx context.Context, r reconcile.Request) (reconcile.Result, error) {
 			l.Info("Reconciling", "key", r)
-			if err := mgr.GetClient().Get(c, r.NamespacedName, &svc); err != nil {
-				l.Error(err, "Can't load service")
+			c := mgr.GetClient()
+			if err := c.Get(ctx, r.NamespacedName, &svc); err != nil {
 				if errors.IsNotFound(err) {
 					// no need to reconcile if not found
 					return reconcile.Result{}, nil
 				}
+				l.Error(err, "Can't load service")
 				// let the controller-runtime deal with backoff logic
 				return reconcile.Result{}, err
 			}
-
 			if label := svc.Labels[ngrokLabel]; label != "true" {
 				l.Info("svc has no ngrok label", "key", r)
 				return reconcile.Result{}, nil
 			}
-			l.Info("creating tunnel for service", "key", r)
-			if err := ensureTunnelPod(c, mgr.GetClient(), svc, token); err != nil {
-				l.Error(err, "error exposing tunnel")
-				return reconcile.Result{}, err
+			if !svc.DeletionTimestamp.IsZero() {
+				// cleanup
+				if err := deleteTunnelPod(ctx, c, svc); err != nil {
+					l.Error(err, "Can't delete service")
+
+					return reconcile.Result{}, err
+				}
+				controllerutil.RemoveFinalizer(&svc, finalizerName)
+				if err := c.Update(ctx, &svc); err != nil {
+					return reconcile.Result{}, err
+				}
+				return reconcile.Result{Requeue: true}, nil
+			} else {
+				l.Info("creating tunnel for service", "key", r)
+				controllerutil.AddFinalizer(&svc, finalizerName)
+				if err := c.Update(ctx, &svc); err != nil {
+					return reconcile.Result{}, err
+				}
+
+				if err := ensureTunnelPod(ctx, c, svc, token); err != nil {
+					l.Error(err, "error exposing tunnel")
+					return reconcile.Result{}, err
+				}
+				return reconcile.Result{}, nil
 			}
-			return reconcile.Result{}, nil
 		}))
 	check(err)
 	check(mgr.Start(context.Background()))
 }
 
-func ensureTunnelPod(ctx context.Context, client client.Client, svc corev1.Service, token string) error {
+func makeLabels(svc corev1.Service) map[string]string {
+	return map[string]string{
+		"exposed-from": getLinkedName(svc),
+	}
+}
+
+func deleteTunnelPod(ctx context.Context, c client.Client, svc corev1.Service) error {
+	pods := &corev1.PodList{}
+	if err := c.List(ctx, pods, client.InNamespace(ngrokNamespace)); err != nil {
+		return err
+	}
+	if len(pods.Items) == 0 {
+		return fmt.Errorf("can't find dependent pod")
+	}
+	if err := c.Delete(ctx, &pods.Items[0]); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureTunnelPod(ctx context.Context, c client.Client, svc corev1.Service, token string) error {
 	target := fmt.Sprintf("%s:%d", svc.Spec.ClusterIP, svc.Spec.Ports[0].Port)
-	spec := getPodSpec(target, getLinkedName(svc), token)
-	if err := client.Create(ctx, &spec); err != nil {
+	spec := getPodSpec(target, svc, token)
+	pods := &corev1.PodList{}
+	if err := c.List(ctx, pods, client.InNamespace(ngrokNamespace), client.MatchingLabels(makeLabels(svc))); err != nil {
+		return err
+	}
+	if len(pods.Items) > 0 {
+		return nil
+	}
+	if err := c.Create(ctx, &spec); err != nil {
 		var statusErr *errors.StatusError
 		if stderr.As(err, &statusErr) && statusErr.ErrStatus.Reason == v1.StatusReasonAlreadyExists {
 			// do nothing on resync or controller restart
@@ -93,11 +141,15 @@ func getLinkedName(svc corev1.Service) string {
 	return fmt.Sprintf("ns-%s-svc-%s", svc.Namespace, svc.Name)
 }
 
-func getPodSpec(target string, name string, token string) corev1.Pod {
+func getPodSpec(target string, svc corev1.Service, token string) corev1.Pod {
 	uid := int64(0)
 	return corev1.Pod{
-		TypeMeta:   v1.TypeMeta{Kind: "Pod", APIVersion: "v1"},
-		ObjectMeta: v1.ObjectMeta{Name: name, Namespace: ngrokNamespace},
+		TypeMeta: v1.TypeMeta{Kind: "Pod", APIVersion: "v1"},
+		ObjectMeta: v1.ObjectMeta{
+			Namespace:    ngrokNamespace,
+			GenerateName: "ngrok-tunnel-",
+			Labels:       makeLabels(svc),
+		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
 				{
