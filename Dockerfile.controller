@@ -1,0 +1,7 @@
+FROM golang:1.17-alpine
+ADD . /src
+WORKDIR /src
+RUN go build -o tunnel-controller main.go
+RUN cp ./tunnel-controller /bin/tunnel-controller
+ENV KUBECONFIG=/tmp/kubeconfig
+CMD ["/bin/tunnel-controller"]
